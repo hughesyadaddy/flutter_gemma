@@ -118,6 +118,23 @@ class SmartDownloader {
     }
   }
 
+  /// Ends a download wait without throwing into [_downloadWithSmartRetry]'s
+  /// generic retry [catch]. Stream hub closure/disposal is not retryable.
+  static Future<void> _terminateFromUpdatesStream({
+    required StreamController<int> progress,
+    required Completer<void> completer,
+    required Object error,
+    StackTrace? stackTrace,
+    StreamSubscription? listener,
+  }) async {
+    if (!progress.isClosed) {
+      progress.addError(error, stackTrace ?? StackTrace.current);
+      progress.close();
+    }
+    await listener?.cancel();
+    _completeIfPending(completer);
+  }
+
   static Stream<TaskUpdate> _getUpdatesStream() {
     _broadcastStream ??= FileDownloader().updates.asBroadcastStream();
     return _broadcastStream!;
@@ -359,25 +376,25 @@ class SmartDownloader {
             }
           },
           onError: (Object error, StackTrace stackTrace) async {
-            if (!progress.isClosed) {
-              progress.addError(error, stackTrace);
-              progress.close();
-            }
-            await listener?.cancel();
-            if (!completer.isCompleted) {
-              completer.completeError(error, stackTrace);
-            }
+            await _terminateFromUpdatesStream(
+              progress: progress,
+              completer: completer,
+              error: error,
+              stackTrace: stackTrace,
+              listener: listener,
+            );
           },
-          onDone: () {
-            if (!completer.isCompleted) {
-              completer.completeError(
-                StateError(
-                  'Download updates stream closed before task $taskId '
-                  'completed',
-                ),
-                StackTrace.current,
-              );
-            }
+          onDone: () async {
+            if (completer.isCompleted) return;
+            await _terminateFromUpdatesStream(
+              progress: progress,
+              completer: completer,
+              error: StateError(
+                'Download updates stream closed before task $taskId '
+                'completed',
+              ),
+              listener: listener,
+            );
           },
         );
 
@@ -430,6 +447,7 @@ class SmartDownloader {
 
       // Create a completer to wait for download completion
       final completer = Completer<void>();
+      var awaitingResumeUpdate = false;
 
       // Listen to broadcast stream to get full status info including HTTP code
       // Using broadcast stream allows multiple downloads and retries
@@ -454,6 +472,7 @@ class SmartDownloader {
 
             switch (update.status) {
               case TaskStatus.complete:
+                awaitingResumeUpdate = false;
                 if (!progress.isClosed) {
                   progress.add(100);
                   progress.close();
@@ -504,14 +523,17 @@ class SmartDownloader {
                 // Only cleanup if no resume is pending
                 // If resume was triggered, we need to keep listening for the result
                 if (!resumePending) {
+                  awaitingResumeUpdate = false;
                   await listener?.cancel();
                   _completeIfPending(completer);
                 } else {
+                  awaitingResumeUpdate = true;
                   gemmaLog('🔄 Resume pending - keeping listener active');
                 }
                 break;
 
               case TaskStatus.canceled:
+                awaitingResumeUpdate = false;
                 if (!progress.isClosed) {
                   progress.addError(
                     const DownloadException(DownloadError.canceled()),
@@ -547,8 +569,11 @@ class SmartDownloader {
                 );
 
                 if (!resumePending404) {
+                  awaitingResumeUpdate = false;
                   await listener?.cancel();
                   _completeIfPending(completer);
+                } else {
+                  awaitingResumeUpdate = true;
                 }
                 break;
 
@@ -558,25 +583,33 @@ class SmartDownloader {
           }
         },
         onError: (Object error, StackTrace stackTrace) async {
-          if (!progress.isClosed) {
-            progress.addError(error, stackTrace);
-            progress.close();
-          }
-          await listener?.cancel();
-          if (!completer.isCompleted) {
-            completer.completeError(error, stackTrace);
-          }
-        },
-        onDone: () {
-          if (!completer.isCompleted) {
-            completer.completeError(
-              StateError(
-                'Download updates stream closed before task ${task.taskId} '
-                'completed',
-              ),
-              StackTrace.current,
+          if (completer.isCompleted || awaitingResumeUpdate) {
+            gemmaLog(
+              '⚠️ Ignoring updates-stream error while download active: $error',
             );
+            return;
           }
+          await _terminateFromUpdatesStream(
+            progress: progress,
+            completer: completer,
+            error: error,
+            stackTrace: stackTrace,
+            listener: listener,
+          );
+        },
+        onDone: () async {
+          if (completer.isCompleted || awaitingResumeUpdate) {
+            return;
+          }
+          await _terminateFromUpdatesStream(
+            progress: progress,
+            completer: completer,
+            error: StateError(
+              'Download updates stream closed before task ${task.taskId} '
+              'completed',
+            ),
+            listener: listener,
+          );
         },
       );
 
