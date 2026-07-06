@@ -12,6 +12,8 @@ linter:
     prefer_final_fields: false
 
 analyzer:
+  exclude:
+    - packages/**
   errors:
     # Treat warnings as info (example app demonstrates backward compatibility)
     deprecated_member_use: info

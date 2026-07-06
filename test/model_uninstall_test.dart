@@ -30,7 +30,8 @@ class MockFileSystemService implements FileSystemService {
       '/bundled/$resourceName';
 
   @override
-  Future<int> getFileSize(String path) async => _files.contains(path) ? 1024 : 0;
+  Future<int> getFileSize(String path) async =>
+      _files.contains(path) ? 1024 : 0;
 
   @override
   Future<String> getTargetPath(String filename) async => '/models/$filename';
@@ -88,6 +89,7 @@ class MockDownloadService implements DownloadService {
     String? token,
     int maxRetries = 10,
     CancelToken? cancelToken,
+    Stream<dynamic>? updatesStream,
     bool? foreground,
   }) async* {
     fileSystem.createFile(targetPath);
@@ -253,8 +255,7 @@ void main() {
       // NOT calling: await mockRepo.deleteModel(modelId);
 
       // Assert - demonstrates the bug
-      expect(mockFS.hasFile(modelPath), isFalse,
-          reason: 'File was deleted');
+      expect(mockFS.hasFile(modelPath), isFalse, reason: 'File was deleted');
       expect(mockRepo.hasModel(modelId), isTrue,
           reason: 'BUG: Metadata still exists after file deletion');
       expect(await mockRepo.isInstalled(modelId), isTrue,
@@ -393,7 +394,8 @@ void main() {
           reason: 'isInstalled should return false after uninstall');
       expect(mockRepo.hasModel(modelId), isFalse,
           reason: 'Metadata should be deleted');
-      expect(mockFS.hasFile(modelPath), isFalse, reason: 'File should be deleted');
+      expect(mockFS.hasFile(modelPath), isFalse,
+          reason: 'File should be deleted');
     });
 
     test('metadata persistence causes false positive on isInstalled (the bug)',
