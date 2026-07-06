@@ -112,6 +112,12 @@ class SmartDownloader {
   static Stream<TaskUpdate> debugResolveUpdatesStream() =>
       _resolveUpdatesStream();
 
+  static void _completeIfPending(Completer<void> completer) {
+    if (!completer.isCompleted) {
+      completer.complete();
+    }
+  }
+
   static Stream<TaskUpdate> _getUpdatesStream() {
     _broadcastStream ??= FileDownloader().updates.asBroadcastStream();
     return _broadcastStream!;
@@ -160,8 +166,12 @@ class SmartDownloader {
       cancelToken: cancelToken,
     ).listen(
       (_) {}, // Ignore progress updates
-      onError: (error) => completer.completeError(error),
-      onDone: () => completer.complete(),
+      onError: (error) {
+        if (!completer.isCompleted) {
+          completer.completeError(error);
+        }
+      },
+      onDone: () => _completeIfPending(completer),
       cancelOnError: true,
     );
 
@@ -329,7 +339,7 @@ class SmartDownloader {
                   progress.close();
                 }
                 await listener?.cancel();
-                completer.complete();
+                _completeIfPending(completer);
               } else if (update.status == TaskStatus.failed ||
                   update.status == TaskStatus.canceled) {
                 // Existing task failed - let caller handle retry
@@ -344,7 +354,7 @@ class SmartDownloader {
                   progress.close();
                 }
                 await listener?.cancel();
-                completer.complete();
+                _completeIfPending(completer);
               }
             }
           },
@@ -449,7 +459,7 @@ class SmartDownloader {
                   progress.close();
                 }
                 await listener?.cancel();
-                completer.complete(); // ✅ Signal completion
+                _completeIfPending(completer); // ✅ Signal completion
                 break;
 
               case TaskStatus.failed:
@@ -495,7 +505,7 @@ class SmartDownloader {
                 // If resume was triggered, we need to keep listening for the result
                 if (!resumePending) {
                   await listener?.cancel();
-                  completer.complete();
+                  _completeIfPending(completer);
                 } else {
                   gemmaLog('🔄 Resume pending - keeping listener active');
                 }
@@ -510,7 +520,7 @@ class SmartDownloader {
                   progress.close();
                 }
                 await listener?.cancel();
-                completer.complete(); // ✅ Signal completion
+                _completeIfPending(completer); // ✅ Signal completion
                 break;
 
               case TaskStatus.notFound:
@@ -538,7 +548,7 @@ class SmartDownloader {
 
                 if (!resumePending404) {
                   await listener?.cancel();
-                  completer.complete();
+                  _completeIfPending(completer);
                 }
                 break;
 
