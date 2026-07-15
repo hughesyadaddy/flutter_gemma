@@ -543,7 +543,18 @@ Future<void> _processBundle({
     }
   }
 
-  output.dependencies.add(prebuiltDir);
+  // Depend on the files inside the prebuilt dir, never the directory
+  // itself: Flutter's build system treats directory inputs as
+  // always-missing, which forces dart_build (and the entire Xcode
+  // "Run Script" phase) to rerun on every incremental build.
+  final prebuiltDirEntity = Directory.fromUri(prebuiltDir);
+  if (prebuiltDirEntity.existsSync()) {
+    for (final entity in prebuiltDirEntity.listSync()) {
+      if (entity is File) {
+        output.dependencies.add(entity.uri);
+      }
+    }
+  }
 }
 
 // ============================================================================
