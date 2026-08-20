@@ -619,6 +619,13 @@ class SmartDownloader {
       gemmaLog('🔵 Enqueueing task ${task.taskId}...');
       final result = await downloader.enqueue(task);
       gemmaLog('🔵 Enqueue result: $result');
+      // Fail closed: enqueue==false yields no TaskUpdates, so awaiting
+      // completer.future would hang forever (running@0 in hosts).
+      if (!result) {
+        throw StateError(
+          'Failed to enqueue download task ${task.taskId}',
+        );
+      }
 
       // Notify about task ID for cancellation
       onTaskCreated?.call(task.taskId); // ← ADD: Notify task created
