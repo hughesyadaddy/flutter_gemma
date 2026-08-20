@@ -467,7 +467,7 @@ class WebInferenceModel extends InferenceModel {
 
       final llmInference = await LlmInference.createFromOptions(fileset, config).toDart;
 
-      session = WebModelSession(
+      final createdSession = WebModelSession(
         modelType: modelType,
         fileType: fileType,
         llmInference: llmInference,
@@ -476,8 +476,9 @@ class WebInferenceModel extends InferenceModel {
         onClose: onClose,
       );
 
-      completer.complete(session);
-      return completer.future;
+      session = createdSession;
+      completer.complete(createdSession);
+      return createdSession;
     } catch (e, st) {
       completer.completeError(e, st);
       rethrow;
