@@ -50,7 +50,7 @@ void main() {
 
     final resolved = SmartDownloader.debugResolveUpdatesStream();
     final errors = <Object>[];
-    final sub1 = resolved.listen((_) {});
+    final sub1 = resolved.listen((_) {}, onError: (_) {});
     final sub2 = resolved.listen((_) {}, onError: errors.add);
 
     hub.addError(StateError('hub failure'));

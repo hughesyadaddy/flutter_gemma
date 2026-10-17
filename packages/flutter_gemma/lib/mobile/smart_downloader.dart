@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:io';
 
 import 'package:flutter/foundation.dart';
 import 'package:background_downloader/background_downloader.dart';
@@ -6,6 +7,9 @@ import 'package:flutter_gemma/core/domain/download_error.dart';
 import 'package:flutter_gemma/core/domain/download_exception.dart';
 import 'package:flutter_gemma/core/model_management/cancel_token.dart';
 import 'package:flutter_gemma/core/utils/gemma_log.dart';
+import 'package:flutter_gemma/mobile/download_object_probe.dart';
+import 'package:flutter_gemma/mobile/download_resume_store.dart';
+import 'package:flutter_gemma/mobile/download_task_identity.dart';
 
 /// Smart downloader with HTTP-aware retry logic
 ///
@@ -26,6 +30,57 @@ class SmartDownloader {
   // Track if FileDownloader has been configured
   static bool _isConfigured = false;
   static bool? _lastForegroundSetting;
+
+  /// Prevents two concurrent SmartDownloader waits for the same model file.
+  static final Set<String> _inFlightStableTaskIds = <String>{};
+
+  static final DownloadResumeStore _resumeStore = DownloadResumeStore();
+  static RemoteObjectProbe _objectProbe = const RemoteObjectProbe();
+
+  @visibleForTesting
+  static void debugResetConcurrencyAndProbe({
+    RemoteObjectProbe? probe,
+  }) {
+    _inFlightStableTaskIds.clear();
+    if (probe != null) {
+      _objectProbe = probe;
+    } else {
+      _objectProbe = const RemoteObjectProbe();
+    }
+  }
+
+  @visibleForTesting
+  static String debugStableTaskId({
+    required String url,
+    required String targetPath,
+  }) => stableDownloadTaskId(url: url, targetPath: targetPath);
+
+  @visibleForTesting
+  static String debugLegacyTaskId({
+    required String url,
+    required String targetPath,
+  }) => legacyDownloadTaskId(url: url, targetPath: targetPath);
+
+  @visibleForTesting
+  static Map<String, String> debugDownloadHeaders(String? token) =>
+      _downloadHeaders(token);
+
+  @visibleForTesting
+  static Future<bool> debugManualRangeContinue({
+    required String url,
+    required Map<String, String> headers,
+    required String targetPath,
+    required int startByte,
+    required StreamController<int> progress,
+    String? ifRangeEtag,
+  }) => _manualRangeContinue(
+    url: url,
+    headers: headers,
+    targetPath: targetPath,
+    startByte: startByte,
+    progress: progress,
+    ifRangeEtag: ifRangeEtag,
+  );
 
   /// Configure FileDownloader for foreground mode
   ///
@@ -149,6 +204,350 @@ class SmartDownloader {
       return _configuredBroadcastStream!;
     }
     return _getUpdatesStream();
+  }
+
+  static Map<String, String> _downloadHeaders(String? token) {
+    if (token != null) {
+      return {
+        'Authorization': 'Bearer $token',
+        'Connection': 'keep-alive',
+        'Cache-Control': 'no-cache, no-store',
+        'Pragma': 'no-cache',
+      };
+    }
+    return {
+      'Connection': 'keep-alive',
+      'Cache-Control': 'no-cache, no-store',
+      'Pragma': 'no-cache',
+    };
+  }
+
+  static Future<int> _localPartialBytes(String targetPath) async {
+    final file = File(targetPath);
+    if (!await file.exists()) {
+      return 0;
+    }
+    return file.length();
+  }
+
+  static Future<DownloadTask?> _findExistingTask({
+    required FileDownloader downloader,
+    required String url,
+    required String targetPath,
+    required String stableTaskId,
+  }) async {
+    for (final id in downloadTaskIdsToProbe(
+      url: url,
+      targetPath: targetPath,
+    )) {
+      final task = await downloader.taskForId(id);
+      if (task is DownloadTask) {
+        return task;
+      }
+    }
+    return null;
+  }
+
+  static Future<DownloadTask> _taskWithStableId({
+    required DownloadTask task,
+    required String stableTaskId,
+    required String url,
+    required Map<String, String> headers,
+  }) async {
+    if (task.taskId == stableTaskId && task.url == url) {
+      return task;
+    }
+    final updated = task.copyWith(
+      taskId: stableTaskId,
+      url: url,
+      headers: headers,
+    );
+    if (task.taskId != stableTaskId) {
+      await _resumeStore.migrateResumeData(
+        fromTaskId: task.taskId,
+        toTaskId: stableTaskId,
+        updatedTask: updated,
+      );
+      await _resumeStore.deleteTaskRecord(task.taskId);
+    }
+    return updated;
+  }
+
+  static Future<ResumeValidationDecision> _validationDecisionForResume({
+    required String url,
+    required Map<String, String> headers,
+    required String targetPath,
+    required ResumeData? resumeData,
+  }) async {
+    final localBytes = await _localPartialBytes(targetPath);
+    final fingerprint = await _objectProbe.head(url: url, headers: headers);
+    if (fingerprint == null) {
+      return localBytes > 0
+          ? ResumeValidationDecision.resumeFromPartial
+          : ResumeValidationDecision.restartFromZero;
+    }
+    if (fingerprint.statusCode == 404) {
+      return ResumeValidationDecision.restartFromZero;
+    }
+    return validateRemoteAgainstResume(
+      remoteContentLength: fingerprint.contentLength,
+      remoteEtag: fingerprint.etag,
+      storedEtag: resumeData?.eTag,
+      localPartialBytes: localBytes,
+    );
+  }
+
+  static Future<void> _truncatePartial(String targetPath) async {
+    final file = File(targetPath);
+    if (await file.exists()) {
+      await file.writeAsBytes(<int>[], flush: true);
+    }
+  }
+
+  static Future<bool> _manualRangeContinue({
+    required String url,
+    required Map<String, String> headers,
+    required String targetPath,
+    required int startByte,
+    required StreamController<int> progress,
+    CancelToken? cancelToken,
+    int? expectedTotalBytes,
+    String? ifRangeEtag,
+  }) async {
+    final client = HttpClient()..connectionTimeout = const Duration(seconds: 10);
+    IOSink? sink;
+    try {
+      cancelToken?.throwIfCancelled();
+      final file = File(targetPath);
+      if (startByte == 0) {
+        await _truncatePartial(targetPath);
+      }
+      sink = file.openWrite(mode: startByte == 0 ? FileMode.write : FileMode.append);
+      final request = await client.getUrl(Uri.parse(url));
+      for (final entry in headers.entries) {
+        request.headers.set(entry.key, entry.value);
+      }
+      if (startByte > 0) {
+        request.headers.set(HttpHeaders.rangeHeader, 'bytes=$startByte-');
+        if (ifRangeEtag != null && ifRangeEtag.isNotEmpty) {
+          request.headers.set(HttpHeaders.ifRangeHeader, ifRangeEtag);
+        }
+      }
+      final response = await request.close();
+      final status = response.statusCode;
+      if (startByte > 0 && status != 206 && status != 200) {
+        return false;
+      }
+      if (startByte == 0 && status != 200) {
+        return false;
+      }
+
+      var received = startByte;
+      int? total = expectedTotalBytes;
+      final contentRange = response.headers.value(HttpHeaders.contentRangeHeader);
+      if (contentRange != null) {
+        final match = RegExp(r'/(\d+)\s*$').firstMatch(contentRange);
+        if (match != null) {
+          total = int.tryParse(match.group(1)!);
+        }
+      }
+      total ??= fingerprintContentLength(response);
+
+      await for (final chunk in response) {
+        cancelToken?.throwIfCancelled();
+        sink.add(chunk);
+        received += chunk.length;
+        if (total != null && total > 0 && !progress.isClosed) {
+          final percents = ((received / total) * 100).round().clamp(0, 100);
+          progress.add(percents);
+        }
+      }
+      await sink.flush();
+      await sink.close();
+      sink = null;
+      if (total != null && received < total) {
+        return false;
+      }
+      if (!progress.isClosed) {
+        progress.add(100);
+        progress.close();
+      }
+      return true;
+    } on Object catch (error) {
+      gemmaLog('❌ manual Range continue failed: $error');
+      return false;
+    } finally {
+      await sink?.close();
+      client.close(force: true);
+    }
+  }
+
+  static int? fingerprintContentLength(HttpClientResponse response) {
+    final raw = response.headers.value(HttpHeaders.contentLengthHeader);
+    if (raw == null) {
+      return null;
+    }
+    return int.tryParse(raw);
+  }
+
+  static Future<bool> _rebindUrlAndResume({
+    required DownloadTask task,
+    required FileDownloader downloader,
+    required String url,
+    required String targetPath,
+    required String stableTaskId,
+    required Map<String, String> headers,
+    required StreamController<int> progress,
+    CancelToken? cancelToken,
+  }) async {
+    final rebound = await _taskWithStableId(
+      task: task,
+      stableTaskId: stableTaskId,
+      url: url,
+      headers: headers,
+    );
+    final resumeData = await _resumeStore.resumeDataFor(rebound.taskId);
+    final decision = await _validationDecisionForResume(
+      url: url,
+      headers: headers,
+      targetPath: targetPath,
+      resumeData: resumeData,
+    );
+
+    if (decision == ResumeValidationDecision.restartFromZero) {
+      gemmaLog('🔁 Object changed — restarting download from byte 0');
+      await _resumeStore.deleteResumeData(rebound.taskId);
+      await _truncatePartial(targetPath);
+      try {
+        await downloader.cancelTasksWithIds([rebound.taskId]);
+      } catch (_) {}
+      await _resumeStore.deleteTaskRecord(rebound.taskId);
+      return false;
+    }
+
+    final partialBytes = await _localPartialBytes(targetPath);
+    if (partialBytes <= 0) {
+      return false;
+    }
+
+    if (resumeData != null) {
+      await _resumeStore.saveResumeData(
+        ResumeData(
+          rebound,
+          resumeData.data,
+          resumeData.requiredStartByte,
+          resumeData.eTag,
+        ),
+      );
+      if (await downloader.taskCanResume(rebound)) {
+        gemmaLog('🔄 Resuming rebound task ${rebound.taskId} at $partialBytes B');
+        final resumed = await downloader.resume(rebound);
+        if (resumed) {
+          return true;
+        }
+      }
+    }
+
+    gemmaLog('🔄 Falling back to manual Range resume at $partialBytes B');
+    final ok = await _manualRangeContinue(
+      url: url,
+      headers: headers,
+      targetPath: targetPath,
+      startByte: partialBytes,
+      progress: progress,
+      cancelToken: cancelToken,
+      expectedTotalBytes: resumeData != null
+          ? int.tryParse(resumeData.data)
+          : null,
+      ifRangeEtag: resumeData?.eTag,
+    );
+    if (ok) {
+      await _resumeStore.deleteResumeData(rebound.taskId);
+      await _resumeStore.deleteTaskRecord(rebound.taskId);
+    }
+    return ok;
+  }
+
+  static Future<void> _waitForTaskCompletion({
+    required String taskId,
+    required StreamController<int> progress,
+    required Completer<void> completer,
+    void Function(StreamSubscription)? onListenerCreated,
+    void Function(String taskId)? onTaskCreated,
+    Future<bool> Function(TaskStatus status, int? httpCode)? onTerminalFailure,
+  }) async {
+    StreamSubscription? listener;
+    listener = _resolveUpdatesStream().listen(
+      (update) async {
+        if (update.task.taskId != taskId) return;
+
+        if (update is TaskProgressUpdate) {
+          final percents = (update.progress * 100).round();
+          gemmaLog('📊 Progress (existing): $percents%');
+          if (!progress.isClosed) {
+            progress.add(percents.clamp(0, 100));
+          }
+        } else if (update is TaskStatusUpdate) {
+          gemmaLog('📡 TaskStatusUpdate (existing): ${update.status}');
+          if (update.status == TaskStatus.complete) {
+            if (!progress.isClosed) {
+              progress.add(100);
+              progress.close();
+            }
+            await listener?.cancel();
+            _completeIfPending(completer);
+          } else if (update.status == TaskStatus.failed ||
+              update.status == TaskStatus.canceled ||
+              update.status == TaskStatus.notFound) {
+            final handled = onTerminalFailure != null
+                ? await onTerminalFailure(
+                    update.status,
+                    update.responseStatusCode,
+                  )
+                : false;
+            if (handled) {
+              return;
+            }
+            if (!progress.isClosed) {
+              progress.addError(
+                DownloadException(
+                  DownloadError.network(
+                    'Existing download failed: ${update.status}',
+                  ),
+                ),
+              );
+              progress.close();
+            }
+            await listener?.cancel();
+            _completeIfPending(completer);
+          }
+        }
+      },
+      onError: (Object error, StackTrace stackTrace) async {
+        await _terminateFromUpdatesStream(
+          progress: progress,
+          completer: completer,
+          error: error,
+          stackTrace: stackTrace,
+          listener: listener,
+        );
+      },
+      onDone: () async {
+        if (completer.isCompleted) return;
+        await _terminateFromUpdatesStream(
+          progress: progress,
+          completer: completer,
+          error: StateError(
+            'Download updates stream closed before task $taskId completed',
+          ),
+          listener: listener,
+        );
+      },
+    );
+
+    onListenerCreated?.call(listener);
+    onTaskCreated?.call(taskId);
+    await completer.future;
   }
 
   /// Downloads a file with smart retry logic and HTTP-aware error handling
@@ -309,17 +708,23 @@ class SmartDownloader {
       return;
     }
 
-    // Generate deterministic taskId based on URL + targetPath
-    // This prevents duplicate downloads of the same file
-    final taskId =
-        '${url.hashCode.toUnsigned(32).toRadixString(16)}_${targetPath.hashCode.toUnsigned(32).toRadixString(16)}';
+    final stableTaskId = stableDownloadTaskId(
+      url: url,
+      targetPath: targetPath,
+    );
+    final headers = _downloadHeaders(token);
 
     gemmaLog(
       '🔵 _downloadWithSmartRetry called - attempt $currentAttempt/$maxRetries',
     );
     gemmaLog('🔵 URL: $url');
     gemmaLog('🔵 Target: $targetPath');
-    gemmaLog('🔵 TaskId: $taskId');
+    gemmaLog('🔵 TaskId: $stableTaskId');
+
+    while (_inFlightStableTaskIds.contains(stableTaskId)) {
+      await Future<void>.delayed(const Duration(milliseconds: 40));
+    }
+    _inFlightStableTaskIds.add(stableTaskId);
 
     // Declare listener outside try block so it's accessible in catch
     StreamSubscription? listener;
@@ -327,82 +732,82 @@ class SmartDownloader {
     try {
       final downloader = FileDownloader();
 
-      // Check if task already exists (e.g., after app restart or sleep/wake)
-      final existingTask = await downloader.taskForId(taskId);
+      final existingTask = await _findExistingTask(
+        downloader: downloader,
+        url: url,
+        targetPath: targetPath,
+        stableTaskId: stableTaskId,
+      );
       if (existingTask != null) {
         gemmaLog(
-          '🔵 Task $taskId already in progress, attaching to existing...',
+          '🔵 Existing task ${existingTask.taskId} found for $stableTaskId',
         );
+        final record = await _resumeStore.taskRecordFor(existingTask.taskId);
+        final status = record?.status;
 
-        // Create completer to wait for existing task completion
-        final completer = Completer<void>();
+        if (status == TaskStatus.complete) {
+          if (!progress.isClosed) {
+            progress.add(100);
+            progress.close();
+          }
+          onTaskCreated?.call(stableTaskId);
+          return;
+        }
 
-        // Attach listener to existing task
-        listener = _resolveUpdatesStream().listen(
-          (update) async {
-            if (update.task.taskId != taskId) return;
-
-            if (update is TaskProgressUpdate) {
-              final percents = (update.progress * 100).round();
-              gemmaLog('📊 Progress (existing): $percents%');
-              if (!progress.isClosed) {
-                progress.add(percents.clamp(0, 100));
-              }
-            } else if (update is TaskStatusUpdate) {
-              gemmaLog('📡 TaskStatusUpdate (existing): ${update.status}');
-              if (update.status == TaskStatus.complete) {
-                if (!progress.isClosed) {
-                  progress.add(100);
-                  progress.close();
-                }
-                await listener?.cancel();
-                _completeIfPending(completer);
-              } else if (update.status == TaskStatus.failed ||
-                  update.status == TaskStatus.canceled) {
-                // Existing task failed - let caller handle retry
-                if (!progress.isClosed) {
-                  progress.addError(
-                    DownloadException(
-                      DownloadError.network(
-                        'Existing download failed: ${update.status}',
-                      ),
-                    ),
-                  );
-                  progress.close();
-                }
-                await listener?.cancel();
-                _completeIfPending(completer);
-              }
-            }
-          },
-          onError: (Object error, StackTrace stackTrace) async {
-            await _terminateFromUpdatesStream(
-              progress: progress,
-              completer: completer,
-              error: error,
-              stackTrace: stackTrace,
-              listener: listener,
-            );
-          },
-          onDone: () async {
-            if (completer.isCompleted) return;
-            await _terminateFromUpdatesStream(
-              progress: progress,
-              completer: completer,
-              error: StateError(
-                'Download updates stream closed before task $taskId '
-                'completed',
-              ),
-              listener: listener,
-            );
-          },
+        final rebound = await _rebindUrlAndResume(
+          task: existingTask,
+          downloader: downloader,
+          url: url,
+          targetPath: targetPath,
+          stableTaskId: stableTaskId,
+          headers: headers,
+          progress: progress,
+          cancelToken: cancelToken,
         );
+        if (rebound && progress.isClosed) {
+          onTaskCreated?.call(stableTaskId);
+          return;
+        }
 
-        onListenerCreated?.call(listener);
-        onTaskCreated?.call(taskId);
-
-        await completer.future;
-        return;
+        if (status == TaskStatus.running ||
+            status == TaskStatus.enqueued ||
+            status == TaskStatus.waitingToRetry ||
+            status == TaskStatus.paused ||
+            rebound) {
+          final completer = Completer<void>();
+          final activeId = rebound ? stableTaskId : existingTask.taskId;
+          await _waitForTaskCompletion(
+            taskId: activeId,
+            progress: progress,
+            completer: completer,
+            onListenerCreated: onListenerCreated,
+            onTaskCreated: onTaskCreated,
+            onTerminalFailure: (failureStatus, httpCode) async {
+              if (!isSignedUrlExpiryHttpCode(httpCode)) {
+                return false;
+              }
+              final partialBytes = await _localPartialBytes(targetPath);
+              if (partialBytes <= 0) {
+                return false;
+              }
+              return _rebindUrlAndResume(
+                task: existingTask.copyWith(
+                  taskId: activeId,
+                  url: url,
+                  headers: headers,
+                ),
+                downloader: downloader,
+                url: url,
+                targetPath: targetPath,
+                stableTaskId: stableTaskId,
+                headers: headers,
+                progress: progress,
+                cancelToken: cancelToken,
+              );
+            },
+          );
+          return;
+        }
       }
 
       final (baseDirectory, directory, filename) = await Task.split(
@@ -418,22 +823,10 @@ class SmartDownloader {
       );
 
       final task = DownloadTask(
-        taskId: taskId,
+        taskId: stableTaskId,
         url: url,
         group: _downloadGroup,
-        headers: token != null
-            ? {
-                'Authorization': 'Bearer $token',
-                'Connection': 'keep-alive',
-                // Attempt to work around CDN ETag issues
-                'Cache-Control': 'no-cache, no-store',
-                'Pragma': 'no-cache',
-              }
-            : {
-                'Connection': 'keep-alive',
-                'Cache-Control': 'no-cache, no-store',
-                'Pragma': 'no-cache',
-              },
+        headers: headers,
         baseDirectory: baseDirectory,
         directory: directory,
         filename: filename,
@@ -688,6 +1081,8 @@ class SmartDownloader {
           progress.close();
         }
       }
+    } finally {
+      _inFlightStableTaskIds.remove(stableTaskId);
     }
   }
 
@@ -714,28 +1109,51 @@ class SmartDownloader {
     gemmaLog('🟡 httpStatusCode: $httpStatusCode');
     gemmaLog('🟡 progress.isClosed: ${progress.isClosed}');
 
-    // Check if error is retryable based on HTTP status code
+    final stableTaskId = stableDownloadTaskId(
+      url: url,
+      targetPath: targetPath,
+    );
+    final headers = _downloadHeaders(token);
+    final partialBytes = await _localPartialBytes(targetPath);
+
     if (httpStatusCode != null) {
       gemmaLog('🟢 httpStatusCode is not null: $httpStatusCode');
 
-      // Auth errors (401, 403) and not-found (404) should NOT be retried
-      if (httpStatusCode == 401) {
-        gemmaLog('🟢 Detected 401 - stopping immediately');
+      if (isSignedUrlExpiryHttpCode(httpStatusCode) && partialBytes > 0) {
+        gemmaLog(
+          '🔄 Signed URL/auth expiry ($httpStatusCode) with $partialBytes B '
+          'partial — rebinding',
+        );
+        final rebound = await _rebindUrlAndResume(
+          task: task,
+          downloader: downloader,
+          url: url,
+          targetPath: targetPath,
+          stableTaskId: stableTaskId,
+          headers: headers,
+          progress: progress,
+          cancelToken: cancelToken,
+        );
+        if (rebound && progress.isClosed) {
+          return false;
+        }
+        if (rebound) {
+          return true;
+        }
+      }
+
+      if (httpStatusCode == 401 && partialBytes <= 0) {
         if (!progress.isClosed) {
-          gemmaLog('🟢 Adding error to progress stream');
           progress.addError(
             const DownloadException(DownloadError.unauthorized()),
             StackTrace.current,
           );
           progress.close();
-          gemmaLog('🟢 Progress stream closed');
-        } else {
-          gemmaLog('⚠️ Progress already closed - cannot add error!');
         }
-        return false; // Stop immediately, no resume pending
+        return false;
       }
 
-      if (httpStatusCode == 403) {
+      if (httpStatusCode == 403 && partialBytes <= 0) {
         if (!progress.isClosed) {
           progress.addError(
             const DownloadException(DownloadError.forbidden()),
@@ -743,7 +1161,7 @@ class SmartDownloader {
           );
           progress.close();
         }
-        return false; // Stop immediately, no resume pending
+        return false;
       }
 
       if (httpStatusCode == 404) {
@@ -754,7 +1172,7 @@ class SmartDownloader {
           );
           progress.close();
         }
-        return false; // Stop immediately, no resume pending
+        return false;
       }
     }
 
