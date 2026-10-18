@@ -32,7 +32,8 @@ class SmartDownloader {
   static bool? _lastForegroundSetting;
 
   /// Prevents two concurrent SmartDownloader waits for the same model file.
-  static final Set<String> _inFlightStableTaskIds = <String>{};
+  static final Map<String, Future<void>> _inFlightStableTaskGates =
+      <String, Future<void>>{};
 
   static final DownloadResumeStore _resumeStore = DownloadResumeStore();
   static RemoteObjectProbe _objectProbe = const RemoteObjectProbe();
@@ -41,7 +42,7 @@ class SmartDownloader {
   static void debugResetConcurrencyAndProbe({
     RemoteObjectProbe? probe,
   }) {
-    _inFlightStableTaskIds.clear();
+    _inFlightStableTaskGates.clear();
     if (probe != null) {
       _objectProbe = probe;
     } else {
@@ -248,13 +249,26 @@ class SmartDownloader {
     return null;
   }
 
+  static bool _headersEqual(
+    Map<String, String> a,
+    Map<String, String> b,
+  ) {
+    if (a.length != b.length) return false;
+    for (final entry in a.entries) {
+      if (b[entry.key] != entry.value) return false;
+    }
+    return true;
+  }
+
   static Future<DownloadTask> _taskWithStableId({
     required DownloadTask task,
     required String stableTaskId,
     required String url,
     required Map<String, String> headers,
   }) async {
-    if (task.taskId == stableTaskId && task.url == url) {
+    if (task.taskId == stableTaskId &&
+        task.url == url &&
+        _headersEqual(task.headers, headers)) {
       return task;
     }
     final updated = task.copyWith(
@@ -269,6 +283,18 @@ class SmartDownloader {
         updatedTask: updated,
       );
       await _resumeStore.deleteTaskRecord(task.taskId);
+    } else {
+      final resumeData = await _resumeStore.resumeDataFor(updated.taskId);
+      if (resumeData != null) {
+        await _resumeStore.saveResumeData(
+          ResumeData(
+            updated,
+            resumeData.data,
+            resumeData.requiredStartByte,
+            resumeData.eTag,
+          ),
+        );
+      }
     }
     return updated;
   }
@@ -282,9 +308,7 @@ class SmartDownloader {
     final localBytes = await _localPartialBytes(targetPath);
     final fingerprint = await _objectProbe.head(url: url, headers: headers);
     if (fingerprint == null) {
-      return localBytes > 0
-          ? ResumeValidationDecision.resumeFromPartial
-          : ResumeValidationDecision.restartFromZero;
+      return ResumeValidationDecision.restartFromZero;
     }
     if (fingerprint.statusCode == 404) {
       return ResumeValidationDecision.restartFromZero;
@@ -335,10 +359,11 @@ class SmartDownloader {
       }
       final response = await request.close();
       final status = response.statusCode;
-      if (startByte > 0 && status != 206 && status != 200) {
-        return false;
-      }
-      if (startByte == 0 && status != 200) {
+      if (startByte > 0) {
+        if (status != HttpStatus.partialContent) {
+          return false;
+        }
+      } else if (status != HttpStatus.ok) {
         return false;
       }
 
@@ -365,7 +390,7 @@ class SmartDownloader {
       await sink.flush();
       await sink.close();
       sink = null;
-      if (total != null && received < total) {
+      if (total != null && received != total) {
         return false;
       }
       if (!progress.isClosed) {
@@ -407,12 +432,19 @@ class SmartDownloader {
       headers: headers,
     );
     final resumeData = await _resumeStore.resumeDataFor(rebound.taskId);
-    final decision = await _validationDecisionForResume(
-      url: url,
-      headers: headers,
-      targetPath: targetPath,
-      resumeData: resumeData,
-    );
+    final localBytes = await _localPartialBytes(targetPath);
+    final fingerprint = await _objectProbe.head(url: url, headers: headers);
+    if (fingerprint == null) {
+      return false;
+    }
+    final decision = fingerprint.statusCode == 404
+        ? ResumeValidationDecision.restartFromZero
+        : validateRemoteAgainstResume(
+            remoteContentLength: fingerprint.contentLength,
+            remoteEtag: fingerprint.etag,
+            storedEtag: resumeData?.eTag,
+            localPartialBytes: localBytes,
+          );
 
     if (decision == ResumeValidationDecision.restartFromZero) {
       gemmaLog('🔁 Object changed — restarting download from byte 0');
@@ -456,9 +488,7 @@ class SmartDownloader {
       startByte: partialBytes,
       progress: progress,
       cancelToken: cancelToken,
-      expectedTotalBytes: resumeData != null
-          ? int.tryParse(resumeData.data)
-          : null,
+      expectedTotalBytes: fingerprint?.contentLength,
       ifRangeEtag: resumeData?.eTag,
     );
     if (ok) {
@@ -721,10 +751,11 @@ class SmartDownloader {
     gemmaLog('🔵 Target: $targetPath');
     gemmaLog('🔵 TaskId: $stableTaskId');
 
-    while (_inFlightStableTaskIds.contains(stableTaskId)) {
-      await Future<void>.delayed(const Duration(milliseconds: 40));
+    while (_inFlightStableTaskGates.containsKey(stableTaskId)) {
+      await _inFlightStableTaskGates[stableTaskId];
     }
-    _inFlightStableTaskIds.add(stableTaskId);
+    final gate = Completer<void>();
+    _inFlightStableTaskGates[stableTaskId] = gate.future;
 
     // Declare listener outside try block so it's accessible in catch
     StreamSubscription? listener;
@@ -767,6 +798,25 @@ class SmartDownloader {
         if (rebound && progress.isClosed) {
           onTaskCreated?.call(stableTaskId);
           return;
+        }
+
+        if ((status == TaskStatus.failed || status == TaskStatus.canceled) &&
+            !rebound) {
+          final stalledPartial = await _localPartialBytes(targetPath);
+          if (stalledPartial > 0) {
+            if (!progress.isClosed) {
+              progress.addError(
+                DownloadException(
+                  DownloadError.network(
+                    'Partial download could not be resumed after failure',
+                  ),
+                ),
+                StackTrace.current,
+              );
+              progress.close();
+            }
+            return;
+          }
         }
 
         if (status == TaskStatus.running ||
@@ -1082,7 +1132,10 @@ class SmartDownloader {
         }
       }
     } finally {
-      _inFlightStableTaskIds.remove(stableTaskId);
+      _inFlightStableTaskGates.remove(stableTaskId);
+      if (!gate.isCompleted) {
+        gate.complete();
+      }
     }
   }
 
@@ -1140,6 +1193,16 @@ class SmartDownloader {
         if (rebound) {
           return true;
         }
+        if (!progress.isClosed) {
+          progress.addError(
+            httpStatusCode == 403
+                ? const DownloadException(DownloadError.forbidden())
+                : const DownloadException(DownloadError.unauthorized()),
+            StackTrace.current,
+          );
+          progress.close();
+        }
+        return false;
       }
 
       if (httpStatusCode == 401 && partialBytes <= 0) {
