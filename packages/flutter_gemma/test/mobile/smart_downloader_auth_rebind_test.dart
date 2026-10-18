@@ -31,16 +31,17 @@ void main() {
       );
     });
 
-    test('signed URL expiry with partial bytes plans resume not hard fail', () {
-      expect(isSignedUrlExpiryHttpCode(403), isTrue);
+    test('HEAD failure with partial stays inconclusive (resume-only)', () {
       expect(
-        validateRemoteAgainstResume(
-          remoteContentLength: 1_000_000,
-          remoteEtag: '"gemma-v1"',
-          storedEtag: '"gemma-v1"',
+        evaluateHeadProbeForResume(
+          headAttempted: true,
+          headStatusCode: null,
+          remoteContentLength: null,
+          remoteEtag: null,
           localPartialBytes: 512_000,
+          storedEtag: '"gemma-v1"',
         ),
-        ResumeValidationDecision.resumeFromPartial,
+        ResumeValidationDecision.inconclusive,
       );
     });
 

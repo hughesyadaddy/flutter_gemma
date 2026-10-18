@@ -1,7 +1,6 @@
 import 'dart:convert';
 
 import 'package:crypto/crypto.dart';
-import 'package:flutter/foundation.dart';
 
 /// Object identity for a download URL — never tokens, query, or auth.
 ///
@@ -47,10 +46,52 @@ List<String> downloadTaskIdsToProbe({
   return [stable, legacy];
 }
 
-/// HTTP codes that usually mean an expired or invalid signed URL mid-resume.
-bool isSignedUrlExpiryHttpCode(int? code) {
+/// HTTP codes that should trigger URL/auth re-bind when partial bytes exist.
+///
+/// [400] is included only when [detail] looks auth- or expiry-related; a bare
+/// generic 400 does not re-bind.
+bool isAuthOrExpiryRebindHttpCode(int? code, {String? detail}) {
   if (code == null) return false;
-  return code == 400 || code == 401 || code == 403;
+  if (code == 401 || code == 403) return true;
+  if (code != 400) return false;
+  if (detail == null || detail.trim().isEmpty) {
+    return false;
+  }
+  final lower = detail.toLowerCase();
+  const needles = [
+    'expired',
+    'expire',
+    'token',
+    'signature',
+    'signed url',
+    'unauthorized',
+    'forbidden',
+    'invalid jwt',
+    'bad signature',
+    'access denied',
+    'auth',
+  ];
+  for (final needle in needles) {
+    if (lower.contains(needle)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+@Deprecated('Use isAuthOrExpiryRebindHttpCode')
+bool isSignedUrlExpiryHttpCode(int? code) =>
+    isAuthOrExpiryRebindHttpCode(code);
+
+enum ResumeValidationDecision {
+  /// Safe to continue from existing partial bytes.
+  resumeFromPartial,
+
+  /// Server proved the object changed (ETag mismatch, size, full 200 on If-Range).
+  objectChanged,
+
+  /// HEAD/network inconclusive — keep partial, try Range or retry later.
+  inconclusive,
 }
 
 /// Whether a remote fingerprint still matches stored resume metadata.
@@ -61,7 +102,7 @@ ResumeValidationDecision validateRemoteAgainstResume({
   required int localPartialBytes,
 }) {
   if (localPartialBytes <= 0) {
-    return ResumeValidationDecision.restartFromZero;
+    return ResumeValidationDecision.resumeFromPartial;
   }
 
   if (storedEtag != null &&
@@ -69,19 +110,52 @@ ResumeValidationDecision validateRemoteAgainstResume({
       remoteEtag != null &&
       remoteEtag.isNotEmpty &&
       storedEtag != remoteEtag) {
-    return ResumeValidationDecision.restartFromZero;
+    return ResumeValidationDecision.objectChanged;
   }
 
   if (remoteContentLength != null &&
       remoteContentLength > 0 &&
       localPartialBytes > remoteContentLength) {
-    return ResumeValidationDecision.restartFromZero;
+    return ResumeValidationDecision.objectChanged;
   }
 
   return ResumeValidationDecision.resumeFromPartial;
 }
 
-enum ResumeValidationDecision {
-  resumeFromPartial,
-  restartFromZero,
+/// Interprets a HEAD probe for resume (or HEAD failure / unsupported HEAD).
+ResumeValidationDecision evaluateHeadProbeForResume({
+  required bool headAttempted,
+  required int? headStatusCode,
+  required int? remoteContentLength,
+  required String? remoteEtag,
+  required int localPartialBytes,
+  required String? storedEtag,
+}) {
+  if (localPartialBytes <= 0) {
+    return ResumeValidationDecision.resumeFromPartial;
+  }
+  if (!headAttempted) {
+    return ResumeValidationDecision.inconclusive;
+  }
+  if (headStatusCode == null) {
+    return ResumeValidationDecision.inconclusive;
+  }
+  if (headStatusCode == 405 || headStatusCode == 501) {
+    return ResumeValidationDecision.inconclusive;
+  }
+  if (headStatusCode >= 400) {
+    return ResumeValidationDecision.inconclusive;
+  }
+  return validateRemoteAgainstResume(
+    remoteContentLength: remoteContentLength,
+    remoteEtag: remoteEtag,
+    storedEtag: storedEtag,
+    localPartialBytes: localPartialBytes,
+  );
+}
+
+enum ManualRangeResult {
+  completed,
+  retryLater,
+  objectChanged,
 }

@@ -49,8 +49,30 @@ void main() {
     });
   });
 
+  group('isAuthOrExpiryRebindHttpCode', () {
+    test('401 and 403 always re-bind when partial exists', () {
+      expect(isAuthOrExpiryRebindHttpCode(401), isTrue);
+      expect(isAuthOrExpiryRebindHttpCode(403), isTrue);
+    });
+
+    test('generic 400 without detail does not re-bind', () {
+      expect(isAuthOrExpiryRebindHttpCode(400), isFalse);
+      expect(isAuthOrExpiryRebindHttpCode(400, detail: 'malformed field'), isFalse);
+    });
+
+    test('expiry-shaped 400 re-binds', () {
+      expect(
+        isAuthOrExpiryRebindHttpCode(
+          400,
+          detail: 'InvalidJWT: token is expired',
+        ),
+        isTrue,
+      );
+    });
+  });
+
   group('validateRemoteAgainstResume', () {
-    test('etag mismatch restarts from zero', () {
+    test('etag mismatch proves object changed', () {
       expect(
         validateRemoteAgainstResume(
           remoteContentLength: 1000,
@@ -58,7 +80,7 @@ void main() {
           storedEtag: '"a"',
           localPartialBytes: 500,
         ),
-        ResumeValidationDecision.restartFromZero,
+        ResumeValidationDecision.objectChanged,
       );
     });
 
@@ -71,6 +93,50 @@ void main() {
           localPartialBytes: 500,
         ),
         ResumeValidationDecision.resumeFromPartial,
+      );
+    });
+  });
+
+  group('evaluateHeadProbeForResume', () {
+    test('HEAD failure keeps partial (inconclusive)', () {
+      expect(
+        evaluateHeadProbeForResume(
+          headAttempted: true,
+          headStatusCode: null,
+          remoteContentLength: null,
+          remoteEtag: null,
+          localPartialBytes: 512_000,
+          storedEtag: '"gemma"',
+        ),
+        ResumeValidationDecision.inconclusive,
+      );
+    });
+
+    test('HEAD unsupported keeps partial (inconclusive)', () {
+      expect(
+        evaluateHeadProbeForResume(
+          headAttempted: true,
+          headStatusCode: 405,
+          remoteContentLength: null,
+          remoteEtag: null,
+          localPartialBytes: 100,
+          storedEtag: '"gemma"',
+        ),
+        ResumeValidationDecision.inconclusive,
+      );
+    });
+
+    test('HEAD 403 with partial is inconclusive (try Range, not truncate)', () {
+      expect(
+        evaluateHeadProbeForResume(
+          headAttempted: true,
+          headStatusCode: 403,
+          remoteContentLength: null,
+          remoteEtag: null,
+          localPartialBytes: 100,
+          storedEtag: '"gemma"',
+        ),
+        ResumeValidationDecision.inconclusive,
       );
     });
   });

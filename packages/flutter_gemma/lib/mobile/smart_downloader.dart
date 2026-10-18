@@ -67,7 +67,7 @@ class SmartDownloader {
       _downloadHeaders(token);
 
   @visibleForTesting
-  static Future<bool> debugManualRangeContinue({
+  static Future<ManualRangeResult> debugManualRangeContinue({
     required String url,
     required Map<String, String> headers,
     required String targetPath,
@@ -299,26 +299,18 @@ class SmartDownloader {
     return updated;
   }
 
-  static Future<ResumeValidationDecision> _validationDecisionForResume({
-    required String url,
-    required Map<String, String> headers,
+  static Future<void> _clearForProvenObjectChange({
+    required FileDownloader downloader,
+    required String taskId,
     required String targetPath,
-    required ResumeData? resumeData,
   }) async {
-    final localBytes = await _localPartialBytes(targetPath);
-    final fingerprint = await _objectProbe.head(url: url, headers: headers);
-    if (fingerprint == null) {
-      return ResumeValidationDecision.restartFromZero;
-    }
-    if (fingerprint.statusCode == 404) {
-      return ResumeValidationDecision.restartFromZero;
-    }
-    return validateRemoteAgainstResume(
-      remoteContentLength: fingerprint.contentLength,
-      remoteEtag: fingerprint.etag,
-      storedEtag: resumeData?.eTag,
-      localPartialBytes: localBytes,
-    );
+    gemmaLog('🔁 Object changed — clearing partial and resume metadata');
+    await _resumeStore.deleteResumeData(taskId);
+    await _truncatePartial(targetPath);
+    try {
+      await downloader.cancelTasksWithIds([taskId]);
+    } catch (_) {}
+    await _resumeStore.deleteTaskRecord(taskId);
   }
 
   static Future<void> _truncatePartial(String targetPath) async {
@@ -328,7 +320,7 @@ class SmartDownloader {
     }
   }
 
-  static Future<bool> _manualRangeContinue({
+  static Future<ManualRangeResult> _manualRangeContinue({
     required String url,
     required Map<String, String> headers,
     required String targetPath,
@@ -360,11 +352,16 @@ class SmartDownloader {
       final response = await request.close();
       final status = response.statusCode;
       if (startByte > 0) {
+        if (status == HttpStatus.ok &&
+            ifRangeEtag != null &&
+            ifRangeEtag.isNotEmpty) {
+          return ManualRangeResult.objectChanged;
+        }
         if (status != HttpStatus.partialContent) {
-          return false;
+          return ManualRangeResult.retryLater;
         }
       } else if (status != HttpStatus.ok) {
-        return false;
+        return ManualRangeResult.retryLater;
       }
 
       var received = startByte;
@@ -391,16 +388,16 @@ class SmartDownloader {
       await sink.close();
       sink = null;
       if (total != null && received != total) {
-        return false;
+        return ManualRangeResult.retryLater;
       }
       if (!progress.isClosed) {
         progress.add(100);
         progress.close();
       }
-      return true;
+      return ManualRangeResult.completed;
     } on Object catch (error) {
       gemmaLog('❌ manual Range continue failed: $error');
-      return false;
+      return ManualRangeResult.retryLater;
     } finally {
       await sink?.close();
       client.close(force: true);
@@ -432,33 +429,27 @@ class SmartDownloader {
       headers: headers,
     );
     final resumeData = await _resumeStore.resumeDataFor(rebound.taskId);
-    final localBytes = await _localPartialBytes(targetPath);
-    final fingerprint = await _objectProbe.head(url: url, headers: headers);
-    if (fingerprint == null) {
-      return false;
-    }
-    final decision = fingerprint.statusCode == 404
-        ? ResumeValidationDecision.restartFromZero
-        : validateRemoteAgainstResume(
-            remoteContentLength: fingerprint.contentLength,
-            remoteEtag: fingerprint.etag,
-            storedEtag: resumeData?.eTag,
-            localPartialBytes: localBytes,
-          );
-
-    if (decision == ResumeValidationDecision.restartFromZero) {
-      gemmaLog('🔁 Object changed — restarting download from byte 0');
-      await _resumeStore.deleteResumeData(rebound.taskId);
-      await _truncatePartial(targetPath);
-      try {
-        await downloader.cancelTasksWithIds([rebound.taskId]);
-      } catch (_) {}
-      await _resumeStore.deleteTaskRecord(rebound.taskId);
-      return false;
-    }
-
     final partialBytes = await _localPartialBytes(targetPath);
     if (partialBytes <= 0) {
+      return false;
+    }
+
+    final fingerprint = await _objectProbe.head(url: url, headers: headers);
+    final decision = evaluateHeadProbeForResume(
+      headAttempted: true,
+      headStatusCode: fingerprint?.statusCode,
+      remoteContentLength: fingerprint?.contentLength,
+      remoteEtag: fingerprint?.etag,
+      localPartialBytes: partialBytes,
+      storedEtag: resumeData?.eTag,
+    );
+
+    if (decision == ResumeValidationDecision.objectChanged) {
+      await _clearForProvenObjectChange(
+        downloader: downloader,
+        taskId: rebound.taskId,
+        targetPath: targetPath,
+      );
       return false;
     }
 
@@ -481,7 +472,7 @@ class SmartDownloader {
     }
 
     gemmaLog('🔄 Falling back to manual Range resume at $partialBytes B');
-    final ok = await _manualRangeContinue(
+    final rangeResult = await _manualRangeContinue(
       url: url,
       headers: headers,
       targetPath: targetPath,
@@ -491,11 +482,21 @@ class SmartDownloader {
       expectedTotalBytes: fingerprint?.contentLength,
       ifRangeEtag: resumeData?.eTag,
     );
-    if (ok) {
-      await _resumeStore.deleteResumeData(rebound.taskId);
-      await _resumeStore.deleteTaskRecord(rebound.taskId);
+    switch (rangeResult) {
+      case ManualRangeResult.completed:
+        await _resumeStore.deleteResumeData(rebound.taskId);
+        await _resumeStore.deleteTaskRecord(rebound.taskId);
+        return true;
+      case ManualRangeResult.objectChanged:
+        await _clearForProvenObjectChange(
+          downloader: downloader,
+          taskId: rebound.taskId,
+          targetPath: targetPath,
+        );
+        return false;
+      case ManualRangeResult.retryLater:
+        return false;
     }
-    return ok;
   }
 
   static Future<void> _waitForTaskCompletion({
@@ -833,7 +834,7 @@ class SmartDownloader {
             onListenerCreated: onListenerCreated,
             onTaskCreated: onTaskCreated,
             onTerminalFailure: (failureStatus, httpCode) async {
-              if (!isSignedUrlExpiryHttpCode(httpCode)) {
+              if (!isAuthOrExpiryRebindHttpCode(httpCode)) {
                 return false;
               }
               final partialBytes = await _localPartialBytes(targetPath);
@@ -957,6 +958,7 @@ class SmartDownloader {
                   progress: progress,
                   currentAttempt: currentAttempt,
                   httpStatusCode: httpCode,
+                  httpFailureDetail: update.exception?.toString(),
                   currentListener: listener,
                   cancelToken: cancelToken,
                   onListenerCreated: onListenerCreated,
@@ -1005,6 +1007,7 @@ class SmartDownloader {
                   progress: progress,
                   currentAttempt: currentAttempt,
                   httpStatusCode: 404,
+                  httpFailureDetail: update.exception?.toString(),
                   currentListener: listener,
                   cancelToken: cancelToken,
                   onListenerCreated: onListenerCreated,
@@ -1153,6 +1156,7 @@ class SmartDownloader {
     required StreamController<int> progress,
     required int currentAttempt,
     int? httpStatusCode,
+    String? httpFailureDetail,
     StreamSubscription? currentListener,
     CancelToken? cancelToken,
     void Function(StreamSubscription)? onListenerCreated,
@@ -1172,7 +1176,12 @@ class SmartDownloader {
     if (httpStatusCode != null) {
       gemmaLog('🟢 httpStatusCode is not null: $httpStatusCode');
 
-      if (isSignedUrlExpiryHttpCode(httpStatusCode) && partialBytes > 0) {
+      final failureDetail = httpFailureDetail ?? '';
+      if (isAuthOrExpiryRebindHttpCode(
+            httpStatusCode,
+            detail: failureDetail,
+          ) &&
+          partialBytes > 0) {
         gemmaLog(
           '🔄 Signed URL/auth expiry ($httpStatusCode) with $partialBytes B '
           'partial — rebinding',
