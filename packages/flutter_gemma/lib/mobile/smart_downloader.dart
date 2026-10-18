@@ -505,7 +505,12 @@ class SmartDownloader {
     required Completer<void> completer,
     void Function(StreamSubscription)? onListenerCreated,
     void Function(String taskId)? onTaskCreated,
-    Future<bool> Function(TaskStatus status, int? httpCode)? onTerminalFailure,
+    Future<bool> Function(
+      TaskStatus status,
+      int? httpCode,
+      String? failureDetail,
+    )?
+    onTerminalFailure,
   }) async {
     StreamSubscription? listener;
     listener = _resolveUpdatesStream().listen(
@@ -534,6 +539,7 @@ class SmartDownloader {
                 ? await onTerminalFailure(
                     update.status,
                     update.responseStatusCode,
+                    update.exception?.toString(),
                   )
                 : false;
             if (handled) {
@@ -833,8 +839,11 @@ class SmartDownloader {
             completer: completer,
             onListenerCreated: onListenerCreated,
             onTaskCreated: onTaskCreated,
-            onTerminalFailure: (failureStatus, httpCode) async {
-              if (!isAuthOrExpiryRebindHttpCode(httpCode)) {
+            onTerminalFailure: (failureStatus, httpCode, failureDetail) async {
+              if (!isAuthOrExpiryRebindHttpCode(
+                httpCode,
+                detail: failureDetail,
+              )) {
                 return false;
               }
               final partialBytes = await _localPartialBytes(targetPath);

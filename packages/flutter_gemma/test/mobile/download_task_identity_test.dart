@@ -84,6 +84,18 @@ void main() {
       );
     });
 
+    test('partial larger than remote length proves object changed', () {
+      expect(
+        validateRemoteAgainstResume(
+          remoteContentLength: 100,
+          remoteEtag: '"a"',
+          storedEtag: '"a"',
+          localPartialBytes: 500,
+        ),
+        ResumeValidationDecision.objectChanged,
+      );
+    });
+
     test('matching etag resumes from partial', () {
       expect(
         validateRemoteAgainstResume(
